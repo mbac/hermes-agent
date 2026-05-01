@@ -485,7 +485,7 @@ class TestWebSearchSchema:
     def test_web_search_clamps_limit_before_backend_call(self):
         import tools.web_tools
 
-        with patch("tools.web_tools._get_backend", return_value="parallel"), \
+        with patch("tools.web_tools._get_backend_candidates", return_value=["parallel"]), \
              patch("tools.web_tools._parallel_search", return_value={"success": True, "data": {"web": []}}) as mock_search, \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call"), \
@@ -505,7 +505,7 @@ class TestWebSearchErrorHandling:
         firecrawl_client = MagicMock()
         firecrawl_client.search.side_effect = RuntimeError("boom")
 
-        with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
+        with patch("tools.web_tools._get_backend_candidates", return_value=["firecrawl"]), \
              patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
