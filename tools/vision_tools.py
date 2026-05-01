@@ -39,6 +39,7 @@ from urllib.parse import urlparse
 import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from hermes_constants import get_hermes_dir
+from hermes_cli.config import read_raw_config
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 
@@ -781,6 +782,38 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+def _resolve_vision_model_for_handler() -> Optional[str]:
+    """Resolve vision model for the tool handler.
+
+    Config.yaml (``auxiliary.vision.model``) is authoritative. The
+    ``AUXILIARY_VISION_MODEL`` environment variable is only used as a fallback
+    when config does not specify a model — this preserves backward compatibility
+    for env-only setups.
+
+    Passing ``None`` lets the centralized LLM router in
+    ``auxiliary_client._resolve_task_provider_model`` read the config and apply
+    per-task overrides (base_url, api_key, etc.) without a stale explicit
+    override from the tool layer.
+
+    Returns:
+        Explicit model string when a fallback env var is used and config is
+        empty. Otherwise ``None`` so the router resolves from config.yaml.
+    """
+    try:
+        cfg = read_raw_config()
+        vision_cfg = cfg.get("auxiliary", {}).get("vision", {}) if isinstance(cfg, dict) else {}
+        cfg_model = str(vision_cfg.get("model", "")).strip() if isinstance(vision_cfg, dict) else ""
+    except Exception:
+        cfg_model = ""
+    if cfg_model:
+        # Config is authoritative — let the aux client resolve from config.yaml
+        # and ignore any stale AUXILIARY_VISION_MODEL env var (see bug where a
+        # stale env value defeated LiteLLM routing via auxiliary.vision.model).
+        return None
+    # Backward compat: when config is empty, env var can still steer the model.
+    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+
+
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
@@ -788,7 +821,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    model = _resolve_vision_model_for_handler()
     return vision_analyze_tool(image_url, full_prompt, model)
 
 

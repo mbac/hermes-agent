@@ -66,6 +66,7 @@ import requests
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from agent.auxiliary_client import call_llm
+from hermes_cli.config import read_raw_config
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 from hermes_cli.config import cfg_get
@@ -203,12 +204,44 @@ def _get_command_timeout() -> int:
 
 
 def _get_vision_model() -> Optional[str]:
-    """Model for browser_vision (screenshot analysis — multimodal)."""
+    """Model for browser_vision (screenshot analysis — multimodal).
+
+    Config.yaml (``auxiliary.vision.model``) is authoritative. When config
+    specifies a model we return ``None`` so the centralized aux client resolves
+    routing (model, base_url, api_key) from config.yaml. The
+    ``AUXILIARY_VISION_MODEL`` environment variable is only a fallback for
+    env-only setups where config does not specify a model.
+
+    Regression for VISION-ROUTING-FIX: passing a stale env value as an explicit
+    ``model=`` override defeated ``auxiliary.vision.model`` + LiteLLM routing
+    configured in config.yaml.
+    """
+    try:
+        cfg = read_raw_config()
+        vision_cfg = cfg.get("auxiliary", {}).get("vision", {}) if isinstance(cfg, dict) else {}
+        cfg_model = str(vision_cfg.get("model", "")).strip() if isinstance(vision_cfg, dict) else ""
+    except Exception:
+        cfg_model = ""
+    if cfg_model:
+        return None
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
 
 
 def _get_extraction_model() -> Optional[str]:
-    """Model for page snapshot text summarization — same as web_extract."""
+    """Model for page snapshot text summarization — same as web_extract.
+
+    Config.yaml (``auxiliary.web_extract.model``) is authoritative; env var is
+    used only as a fallback when config does not specify a model. Mirrors
+    ``_get_vision_model`` — see VISION-ROUTING-FIX.
+    """
+    try:
+        cfg = read_raw_config()
+        we_cfg = cfg.get("auxiliary", {}).get("web_extract", {}) if isinstance(cfg, dict) else {}
+        cfg_model = str(we_cfg.get("model", "")).strip() if isinstance(we_cfg, dict) else ""
+    except Exception:
+        cfg_model = ""
+    if cfg_model:
+        return None
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 

@@ -976,6 +976,48 @@ def skill_view(
                 if skill_md:
                     break
 
+        # Normalize a duplicated path-like alias such as "foo/foo" -> "foo".
+        # Models sometimes infer category/name syntax from prompts even when the
+        # skill is installed flat. If both path segments are identical, collapse
+        # to the basename and retry before giving up.
+        if not skill_md and "/" in name:
+            parts = [p for p in name.split("/") if p]
+            if len(parts) >= 2 and len(set(parts)) == 1:
+                alias_name = parts[-1]
+                for search_dir in all_dirs:
+                    direct_path = search_dir / alias_name
+                    if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                        skill_dir = direct_path
+                        skill_md = direct_path / "SKILL.md"
+                        break
+                if not skill_md:
+                    for search_dir in all_dirs:
+                        for found_skill_md in search_dir.rglob("SKILL.md"):
+                            if found_skill_md.parent.name == alias_name:
+                                skill_dir = found_skill_md.parent
+                                skill_md = found_skill_md
+                                break
+                        if skill_md:
+                            break
+
+        # Fallback: search by frontmatter name inside SKILL.md.
+        if not skill_md:
+            import re
+            frontmatter_name_re = re.compile(r"^name:\s*(.+?)\s*$", re.MULTILINE)
+            for search_dir in all_dirs:
+                for found_skill_md in search_dir.rglob("SKILL.md"):
+                    try:
+                        _raw = found_skill_md.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    m = frontmatter_name_re.search(_raw)
+                    if m and m.group(1).strip().strip('"\'') == name:
+                        skill_dir = found_skill_md.parent
+                        skill_md = found_skill_md
+                        break
+                if skill_md:
+                    break
+
         # Legacy: flat .md files
         if not skill_md:
             for search_dir in all_dirs:
