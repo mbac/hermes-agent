@@ -1035,6 +1035,57 @@ def skill_view(
         if candidates:
             skill_dir, skill_md = candidates[0]
 
+        # Local patches: additional fallback strategies below.
+
+        # Normalize a duplicated path-like alias such as "foo/foo" -> "foo".
+        if not skill_md and "/" in name:
+            parts = [p for p in name.split("/") if p]
+            if len(parts) >= 2 and len(set(parts)) == 1:
+                alias_name = parts[-1]
+                for search_dir in all_dirs:
+                    direct_path = search_dir / alias_name
+                    if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                        skill_dir = direct_path
+                        skill_md = direct_path / "SKILL.md"
+                        break
+                if not skill_md:
+                    for search_dir in all_dirs:
+                        for found_skill_md in search_dir.rglob("SKILL.md"):
+                            if found_skill_md.parent.name == alias_name:
+                                skill_dir = found_skill_md.parent
+                                skill_md = found_skill_md
+                                break
+                        if skill_md:
+                            break
+
+        # Fallback: search by frontmatter name inside SKILL.md.
+        if not skill_md:
+            import re
+            frontmatter_name_re = re.compile(r"^name:\s*(.+?)\s*$", re.MULTILINE)
+            for search_dir in all_dirs:
+                for found_skill_md in search_dir.rglob("SKILL.md"):
+                    try:
+                        _raw = found_skill_md.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    m = frontmatter_name_re.search(_raw)
+                    if m and m.group(1).strip().strip('"\'') == name:
+                        skill_dir = found_skill_md.parent
+                        skill_md = found_skill_md
+                        break
+                if skill_md:
+                    break
+
+        # Legacy: flat .md files
+        if not skill_md:
+            for search_dir in all_dirs:
+                for found_md in search_dir.rglob(f"{name}.md"):
+                    if found_md.name != "SKILL.md":
+                        skill_md = found_md
+                        break
+                if skill_md:
+                    break
+
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
