@@ -192,6 +192,7 @@ def test_custom_endpoint_models_api_pricing_is_supported(monkeypatch):
     assert float(entry.output_cost_per_million) == 2.0
 
 
+
 def test_deepseek_v4_pro_pricing_entry_exists():
     """Regression test: deepseek-v4-pro must have a pricing entry.
 
@@ -224,3 +225,58 @@ def test_deepseek_v4_pro_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48
+
+
+def test_proxy_upstream_pricing_hook_invoked_after_standard_probe(monkeypatch):
+    """When a proxy's /v1/models returns no pricing, the fallback hook is called.
+
+    LiteLLM and similar proxies follow the OpenAI spec: /v1/models returns
+    only {id, object, created, owned_by} with no cost fields.  The standard
+    fetch_endpoint_model_metadata probe comes up empty.  The secondary
+    _try_proxy_upstream_pricing hook must be called so upstream model IDs
+    and pricing can be resolved from the proxy's own metadata endpoint.
+    """
+    # Standard endpoint probe returns empty pricing
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key=None: {},
+    )
+
+    # Simulate a LiteLLM proxy lookup: model "grok" → upstream "openrouter/x-ai/grok-4.3"
+    def _fake_proxy_probe(route, api_key=""):
+        if route.model == "grok":
+            from agent.usage_pricing import get_pricing_entry as _gpe
+            return _gpe("openrouter/x-ai/grok-4.3")
+        return None
+
+    monkeypatch.setattr(
+        "agent.usage_pricing._try_proxy_upstream_pricing",
+        _fake_proxy_probe,
+    )
+
+    # OpenRouter models API pricing for the upstream
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda: {
+            "x-ai/grok-4.3": {
+                "pricing": {
+                    "prompt": "0.00000125",
+                    "completion": "0.0000025",
+                    "input_cache_read": "0.0000002",
+                }
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "grok",
+        provider="litellm",
+        base_url="http://127.0.0.1:4000/v1",
+    )
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 1.25
+    assert float(entry.output_cost_per_million) == 2.5
+    assert float(entry.cache_read_cost_per_million) == 0.2
+    assert entry.source == "provider_models_api"
+    assert "openrouter" in (entry.source_url or "")
