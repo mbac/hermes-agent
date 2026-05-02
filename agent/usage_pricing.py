@@ -407,18 +407,26 @@ def resolve_billing_route(
     model = (model_name or "").strip()
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
-        if inferred_provider in {"anthropic", "openai", "google"}:
+        if inferred_provider in {"anthropic", "openai", "google", "openrouter", "chatgpt", "deepseek", "minimax", "minimax-cn", "bedrock", "openai-codex"}:
             provider_name = inferred_provider
             model = bare_model
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+    if provider_name == "chatgpt":
+        return BillingRoute(provider="chatgpt", model=model.split("/")[-1] if "/" in model else model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "deepseek":
+        return BillingRoute(provider="deepseek", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "bedrock":
+        return BillingRoute(provider="bedrock", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "google":
+        return BillingRoute(provider="google", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
@@ -483,6 +491,63 @@ def _pricing_entry_from_metadata(
     )
 
 
+
+def _try_proxy_upstream_pricing(
+    route: "BillingRoute",
+    api_key: str = "",
+) -> "Optional[PricingEntry]":
+    """Probe a proxy (LiteLLM or compatible) for upstream model pricing.
+
+    Some local proxies expose full model metadata on a non-OpenAI endpoint.
+    LiteLLM's /model/info includes the real upstream model ID (e.g.
+    "openrouter/x-ai/grok-4.3") and per-token pricing.  The standard
+    OpenAI-compatible /v1/models endpoint returns only {id, object, created,
+    owned_by} -- no pricing fields -- so the standard endpoint probe in
+    get_pricing_entry() comes up empty.
+
+    This function probes /model/info as a secondary source.  When the
+    upstream model is found, it delegates to get_pricing_entry() for the
+    upstream -- which already handles OpenRouter models API, Anthropic
+    official-docs snapshots, subscription-included routes, etc.
+    """
+    import json as _json
+    from urllib.request import Request, urlopen
+
+    base_url = (route.base_url or "").rstrip("/")
+    if not base_url:
+        return None
+
+    # LiteLLM's /model/info lives at the proxy root, not under /v1.
+    raw_base = base_url
+    if raw_base.endswith("/v1"):
+        raw_base = raw_base[:-3]
+    info_url = f"{raw_base}/model/info"
+
+    try:
+        req = Request(info_url)
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        with urlopen(req, timeout=10) as resp:
+            info_data = _json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    model_name = route.model
+    for entry in info_data.get("data", ()):
+        if entry.get("model_name") != model_name:
+            continue
+        upstream = entry.get("litellm_params", {}).get("model", "")
+        if not upstream:
+            return None
+
+        # upstream is e.g. "openrouter/x-ai/grok-4.3" or "anthropic/claude-sonnet-4"
+        # Recurse into standard pricing -- the resolved route will handle
+        # OpenRouter, subscription-included, official-docs snapshots, etc.
+        return get_pricing_entry(model_name=upstream)
+
+    return None
+
+
 def get_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
@@ -510,6 +575,15 @@ def get_pricing_entry(
         )
         if entry:
             return entry
+
+    # Secondary probe: some proxies expose real upstream model IDs and
+    # pricing on a non-OpenAI endpoint.  LiteLLM's /model/info is the
+    # canonical example.  The helper extracts the upstream and delegates
+    # to the existing pricing machinery.
+    proxy_entry = _try_proxy_upstream_pricing(route, api_key=api_key or "")
+    if proxy_entry:
+        return proxy_entry
+
     return _lookup_official_docs_pricing(route)
 
 
