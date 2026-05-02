@@ -321,5 +321,39 @@ class TestAsyncFallback:
 
             result = await web_extract_tool(["https://example.com"])
             data = json.loads(result)
-            # Should have results from Exa
-            assert len(data.get("results", [])) >= 0  # Exa returns content
+            assert data["results"][0]["url"] == "https://ex.com"
+            assert data["results"][0]["title"] == "Exa Page"
+            assert data["results"][0]["content"] == "content"
+            assert mock_exa.get_contents.called
+
+    @pytest.mark.asyncio
+    async def test_extract_fallback_firecrawl_scrape_error_to_exa(self, monkeypatch):
+        """Firecrawl scrape errors are backend failures, so Exa gets a chance."""
+        from tools.web_tools import web_extract_tool
+
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-fake")
+        monkeypatch.setenv("EXA_API_KEY", "exa-fake")
+        monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("FIRECRAWL_API_URL", raising=False)
+
+        with patch("tools.web_tools._get_firecrawl_client") as mock_fc_client, \
+             patch("tools.web_tools._get_exa_client") as mock_exa_client, \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False), \
+             patch("tools.web_tools.check_auxiliary_model", return_value=False):
+
+            mock_fc_client.return_value.scrape.side_effect = httpx.HTTPStatusError(
+                "503", request=MagicMock(), response=MagicMock(status_code=503),
+            )
+
+            mock_exa = MagicMock()
+            mock_exa.get_contents.return_value = MagicMock(results=[
+                MagicMock(url="https://ex.com", title="Exa Page", text="exa content")
+            ])
+            mock_exa_client.return_value = mock_exa
+
+            result = await web_extract_tool(["https://example.com"], use_llm_processing=False)
+            data = json.loads(result)
+            assert data["results"][0]["url"] == "https://ex.com"
+            assert data["results"][0]["content"] == "exa content"
+            assert mock_exa.get_contents.called
