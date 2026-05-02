@@ -201,8 +201,8 @@ def _try_backend_with_fallback(
         if every backend fails.
 
     Backends whose callable raises ``ValueError`` (missing API key) are
-    silently skipped.  Backends that raise any other exception (network
-    error, 5xx) are logged at WARNING and the next backend is tried.
+    treated as unavailable. Other exceptions (network errors, timeouts,
+    5xx responses) are backend failures, so the next candidate is tried.
     """
     candidates = _get_backend_candidates()
     last_error: Exception | None = None
@@ -1241,16 +1241,13 @@ async def _firecrawl_extract(
                     ),
                     timeout=60,
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as timeout_err:
+                message = (
+                    "Scrape timed out after 60s - page may be too large "
+                    "or unresponsive. Try browser_navigate instead."
+                )
                 logger.warning("Firecrawl scrape timed out for %s", url)
-                results.append({
-                    "url": url, "title": "", "content": "",
-                    "error": (
-                        "Scrape timed out after 60s — page may be too "
-                        "large or unresponsive. Try browser_navigate instead."
-                    ),
-                })
-                continue
+                raise TimeoutError(message) from timeout_err
 
             scrape_payload = _extract_scrape_payload(scrape_result)
             metadata = scrape_payload.get("metadata", {})
@@ -1301,11 +1298,11 @@ async def _firecrawl_extract(
             })
 
         except Exception as scrape_err:
-            logger.debug("Scrape failed for %s: %s", url, scrape_err)
-            results.append({
-                "url": url, "title": "", "content": "",
-                "raw_content": "", "error": str(scrape_err),
-            })
+            # Backend failures must raise so the fallback dispatcher can try
+            # the next configured provider. Policy blocks above intentionally
+            # return result rows so blocked URLs are not fetched elsewhere.
+            logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
+            raise
 
     return results
 
