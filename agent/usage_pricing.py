@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
+from urllib.request import Request, urlopen
 
-from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from agent.model_metadata import (
+    _extract_pricing,
+    fetch_endpoint_model_metadata,
+    fetch_model_metadata,
+)
 from utils import base_url_host_matches
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
@@ -77,6 +84,9 @@ class CostResult:
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)
+_PROXY_MODEL_INFO_CACHE_TTL = 300
+_PROXY_MODEL_INFO_TIMEOUT = 2.0
+_proxy_model_info_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = {}
 
 
 # Official docs snapshot entries. Models whose published pricing and cache
@@ -429,7 +439,7 @@ def resolve_billing_route(
         return BillingRoute(provider="google", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-    if provider_name in {"custom", "local"} or (base and "localhost" in base):
+    if provider_name in {"custom", "local", "litellm"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
 
@@ -491,6 +501,38 @@ def _pricing_entry_from_metadata(
     )
 
 
+def _proxy_info_base_url(base_url: str) -> str:
+    raw_base = (base_url or "").rstrip("/")
+    if raw_base.endswith("/v1"):
+        raw_base = raw_base[:-3]
+    return raw_base
+
+
+def _fetch_proxy_model_info(base_url: str, api_key: str = "") -> Optional[Dict[str, Any]]:
+    """Fetch and cache LiteLLM-compatible /model/info responses."""
+    raw_base = _proxy_info_base_url(base_url)
+    if not raw_base:
+        return None
+
+    cached = _proxy_model_info_cache.get(raw_base)
+    if cached is not None:
+        cached_at, payload = cached
+        if (time.time() - cached_at) < _PROXY_MODEL_INFO_CACHE_TTL:
+            return payload
+
+    info_url = f"{raw_base}/model/info"
+    try:
+        req = Request(info_url)
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        with urlopen(req, timeout=_PROXY_MODEL_INFO_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        payload = None
+
+    _proxy_model_info_cache[raw_base] = (time.time(), payload)
+    return payload
+
 
 def _try_proxy_upstream_pricing(
     route: "BillingRoute",
@@ -510,32 +552,32 @@ def _try_proxy_upstream_pricing(
     upstream -- which already handles OpenRouter models API, Anthropic
     official-docs snapshots, subscription-included routes, etc.
     """
-    import json as _json
-    from urllib.request import Request, urlopen
-
     base_url = (route.base_url or "").rstrip("/")
     if not base_url:
         return None
 
-    # LiteLLM's /model/info lives at the proxy root, not under /v1.
-    raw_base = base_url
-    if raw_base.endswith("/v1"):
-        raw_base = raw_base[:-3]
-    info_url = f"{raw_base}/model/info"
-
-    try:
-        req = Request(info_url)
-        if api_key:
-            req.add_header("Authorization", f"Bearer {api_key}")
-        with urlopen(req, timeout=10) as resp:
-            info_data = _json.loads(resp.read().decode())
-    except Exception:
+    info_data = _fetch_proxy_model_info(base_url, api_key=api_key)
+    if not isinstance(info_data, dict):
         return None
 
     model_name = route.model
     for entry in info_data.get("data", ()):
+        if not isinstance(entry, dict):
+            continue
         if entry.get("model_name") != model_name:
             continue
+
+        pricing = _extract_pricing(entry)
+        if pricing:
+            direct_entry = _pricing_entry_from_metadata(
+                {model_name: {"pricing": pricing}},
+                model_name,
+                source_url=f"{_proxy_info_base_url(base_url)}/model/info",
+                pricing_version="litellm-model-info",
+            )
+            if direct_entry:
+                return direct_entry
+
         upstream = entry.get("litellm_params", {}).get("model", "")
         if not upstream:
             return None
