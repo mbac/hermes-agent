@@ -124,14 +124,15 @@ def _get_backend_candidates(capability: str | None = None) -> list[str]:
     Explicit config always comes first (user intent).  The remaining
     backends follow in priority order if their API keys are set.
 
-    When *capability* is ``"search"``, SearXNG is included in the priority
-    list (it is search-only).  For ``"extract"`` and ``"crawl"`` it is
-    excluded.  Per-capability config (``web.{capability}_backend``) takes
-    precedence over the shared ``web.backend`` setting.
+    When *capability* is ``"search"``, SearXNG and OpenRouter are included
+    in the priority list (both are search-only).  For ``"extract"`` and
+    ``"crawl"`` they are excluded.  Per-capability config
+    (``web.{capability}_backend``) takes precedence over the shared
+    ``web.backend`` setting.
     """
     if capability == "search":
         configured = (_get_search_backend() or "").lower().strip()
-        PRIORITY = ("firecrawl", "parallel", "tavily", "exa", "searxng")
+        PRIORITY = ("firecrawl", "parallel", "tavily", "exa", "searxng", "openrouter")
     elif capability == "extract":
         configured = (_get_extract_backend() or "").lower().strip()
         PRIORITY = ("firecrawl", "parallel", "tavily", "exa")
@@ -149,6 +150,7 @@ def _get_backend_candidates(capability: str | None = None) -> list[str]:
         "tavily": lambda: _has_env("TAVILY_API_KEY"),
         "exa": lambda: _has_env("EXA_API_KEY"),
         "searxng": lambda: _has_env("SEARXNG_URL"),
+        "openrouter": lambda: _has_env("OPENROUTER_API_KEY"),
     }
 
     candidates: list[str] = []
@@ -1542,6 +1544,49 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+def _openrouter_web_search(query: str, limit: int) -> dict:
+    """Search via OpenRouter's `web` plugin (server-tools/web-search)."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY environment variable not set")
+
+    model = os.getenv("OPENROUTER_WEB_SEARCH_MODEL", "openai/gpt-4o-mini")
+    resp = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": query}],
+            "plugins": [{"id": "web", "max_results": limit}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    annotations = (
+        (data.get("choices") or [{}])[0]
+        .get("message", {})
+        .get("annotations")
+        or []
+    )
+    web_results = []
+    for i, ann in enumerate(annotations):
+        if ann.get("type") != "url_citation":
+            continue
+        cit = ann.get("url_citation") or {}
+        web_results.append({
+            "url": cit.get("url", ""),
+            "title": cit.get("title", ""),
+            "description": (cit.get("content") or "")[:500],
+            "position": i + 1,
+        })
+    return {"success": True, "data": {"web": web_results}}
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -1616,6 +1661,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             "searxng":    lambda: _searxng_search(query, limit),
             "brave-free": lambda: _brave_free_search(query, limit),
             "ddgs":       lambda: _ddgs_search(query, limit),
+            "openrouter": lambda: _openrouter_web_search(query, limit),
         }
 
         response_data = _try_backend_with_fallback(
