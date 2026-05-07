@@ -171,6 +171,7 @@ export interface SessionUsageResponse {
   cost_status?: 'estimated' | 'exact'
   cost_usd?: number
   input?: number
+  last_routed_model?: null | string
   model?: string
   output?: number
   total?: number
