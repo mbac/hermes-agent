@@ -143,6 +143,7 @@ export interface McpServerStatus {
 export interface SessionInfo {
   cwd?: string
   fast?: boolean
+  last_routed_model?: null | string
   lazy?: boolean
   mcp_servers?: McpServerStatus[]
   model: string
@@ -165,6 +166,7 @@ export interface Usage {
   context_used?: number
   cost_usd?: number
   input: number
+  last_routed_model?: null | string
   output: number
   total: number
 }
