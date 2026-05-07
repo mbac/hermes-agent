@@ -279,6 +279,7 @@ export function StatusRule({
   status,
   statusColor,
   model,
+  lastRoutedModel,
   modelFast,
   modelReasoningEffort,
   usage,
@@ -311,7 +312,13 @@ export function StatusRule({
           ) : (
             <Text color={statusColor}>{status}</Text>
           )}
-          <Text color={t.color.muted}> │ {modelLabel(model, modelReasoningEffort, modelFast)}</Text>
+          <Text color={t.color.muted}>
+            {' │ '}
+            {modelLabel(model, modelReasoningEffort, modelFast)}
+            {lastRoutedModel && lastRoutedModel !== model
+              ? ` → ${shortModelLabel(lastRoutedModel)}`
+              : ''}
+          </Text>
           {ctxLabel ? <Text color={t.color.muted}> │ {ctxLabel}</Text> : null}
           {bar ? (
             <Text color={t.color.muted}>
@@ -460,6 +467,7 @@ interface StatusRuleProps {
   busy: boolean
   cols: number
   cwdLabel: string
+  lastRoutedModel?: null | string
   model: string
   modelFast?: boolean
   modelReasoningEffort?: string

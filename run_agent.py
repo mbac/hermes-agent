@@ -11629,7 +11629,11 @@ class AIAgent:
                     
                     if not self.quiet_mode:
                         self._vprint(f"{self.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
-                    
+
+                    _resp_model = getattr(response, 'model', None)
+                    if _resp_model:
+                        self._last_routed_model = _resp_model
+
                     if self.verbose_logging:
                         # Log response with provider info if available
                         resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
