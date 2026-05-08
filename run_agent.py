@@ -1019,6 +1019,7 @@ class AIAgent:
         _install_safe_stdio()
 
         self.model = model
+        self._last_routed_model: Optional[str] = None
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
@@ -2286,6 +2287,7 @@ class AIAgent:
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
+        self._last_routed_model = None
 
     def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
         """
@@ -2357,6 +2359,7 @@ class AIAgent:
         old_provider = self.provider
 
         # ── Swap core runtime fields ──
+        self._last_routed_model = None
         self.model = new_model
         self.provider = new_provider
         self.base_url = base_url or self.base_url
