@@ -132,13 +132,26 @@ def _get_backend_candidates(capability: str | None = None) -> list[str]:
     """
     if capability == "search":
         configured = (_get_search_backend() or "").lower().strip()
-        PRIORITY = ("firecrawl", "parallel", "tavily", "exa", "searxng", "openrouter")
+        # Free-tier backends trail the paid ones so existing paid setups
+        # are unaffected; brave-free participates in the auto-fallback
+        # chain whenever BRAVE_SEARCH_API_KEY is set.
+        PRIORITY = (
+            "firecrawl", "parallel", "tavily", "exa",
+            "searxng", "brave-free", "openrouter",
+        )
     elif capability == "extract":
         configured = (_get_extract_backend() or "").lower().strip()
         PRIORITY = ("firecrawl", "parallel", "tavily", "exa")
     else:
         configured = (_get_backend() or "").lower().strip()
         PRIORITY = ("firecrawl", "parallel", "tavily", "exa")
+
+    # Opt-in strict pin: when web.strict_backend is true and a known
+    # backend is configured, return only that backend so the dispatcher
+    # cannot silently switch providers.  The chosen backend's callable
+    # will surface the right "API key not set" error if unavailable.
+    if bool(_load_web_config().get("strict_backend", False)) and configured in PRIORITY:
+        return [configured]
 
     CANDIDATE_CHECKS = {
         "firecrawl": lambda: (
@@ -151,6 +164,7 @@ def _get_backend_candidates(capability: str | None = None) -> list[str]:
         "exa": lambda: _has_env("EXA_API_KEY"),
         "searxng": lambda: _has_env("SEARXNG_URL"),
         "openrouter": lambda: _has_env("OPENROUTER_API_KEY"),
+        "brave-free": lambda: _has_env("BRAVE_SEARCH_API_KEY"),
     }
 
     candidates: list[str] = []
@@ -275,6 +289,143 @@ def _ddgs_package_importable() -> bool:
         return False
 
 
+def _is_retryable_backend_error(exc: Exception) -> bool:
+    """Return False on confidently user/permission errors; True otherwise.
+
+    Default-True preserves today's failover behaviour on unknown
+    exceptions.  Only short-circuits the chain when the error message
+    is identifiable as a 4xx user error or input-validation problem
+    that no backend swap will fix.  ``429`` is intentionally retryable
+    (a different backend may have quota).
+    """
+    message = str(exc).lower()
+    non_retryable_markers = (
+        "400", "bad request",
+        "401", "unauthorized",
+        "403", "forbidden",
+        "404", "not found",
+        "422",
+        "invalid parameter", "invalid_param",
+        "unsupported parameter",
+        "invalid query",
+        "malformed",
+        "blocked: url contains",
+        "private or internal network address",
+    )
+    return not any(marker in message for marker in non_retryable_markers)
+
+
+def _is_blocked_extract_row(row: dict) -> bool:
+    """Return True for rows the backend deliberately refused to fetch.
+
+    Such rows reflect SSRF guard or website-policy decisions that every
+    backend honors equally — re-trying with another provider would not
+    succeed, so they are excluded from "did we extract anything?" checks.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("blocked_by_policy"):
+        return True
+    err = row.get("error") or ""
+    return isinstance(err, str) and err.startswith("Blocked:")
+
+
+def _has_extracted_content(results: "list | None") -> bool:
+    """Return True iff at least one non-blocked result row carries usable text.
+
+    A "usable" row is one where ``content`` or ``raw_content`` is a non-empty
+    string after stripping.  Rows that were intentionally not fetched —
+    SSRF-blocked, website-policy-blocked, or anything carrying a ``Blocked:``
+    error string — are excluded from the count: another backend cannot
+    fetch them either, so their absence is not a backend failure.
+
+    Used by the opt-in ``web.fallback_on_empty_extract`` option to decide
+    whether an extract call that *technically* returned (no exception) should
+    nonetheless be treated as a backend failure so the fallback dispatcher
+    advances to the next provider.
+    """
+    for row in results or []:
+        if not isinstance(row, dict) or _is_blocked_extract_row(row):
+            continue
+        content = row.get("content") or row.get("raw_content") or ""
+        if isinstance(content, str) and content.strip():
+            return True
+    return False
+
+
+async def _extract_with_empty_check(
+    factory,
+    fallback_on_empty: bool,
+    backend_name: str,
+):
+    """Invoke an extract callable and optionally raise on all-empty results.
+
+    Wraps a backend's extract function (sync or async) so that the
+    fallback dispatcher can advance to the next provider when the call
+    returned without raising but every non-blocked URL came back with no
+    content.
+
+    Why this exists:
+        Each extract backend has its own "soft failure" mode where the
+        HTTP call succeeds (200 OK) but the page-content extractor
+        returns an empty string — anti-bot redirects, JS-only pages,
+        paywalls, SDK quirks where one URL out of N times out without
+        raising, etc.  Without this wrapper, those soft failures look
+        like a successful extract to the dispatcher, the chain stops at
+        the first backend, and the user gets back zero useful text even
+        though a different provider would have succeeded.
+
+    Why it is opt-in:
+        For some workflows an empty extract is a legitimate signal
+        ("this page genuinely has no extractable text") and the user
+        does not want a second API call billed against their account
+        just to confirm.  Default-off preserves existing semantics.
+        Enable via ``web.fallback_on_empty_extract: true`` in
+        ``~/.hermes/config.yaml``.
+
+    Why blocked rows are skipped (see :func:`_has_extracted_content`):
+        Policy-blocked and SSRF-blocked rows reflect intentional refusals
+        that every backend honors equally.  Counting them as "empty"
+        would trigger pointless cross-provider retries on URLs that are
+        never going to be fetched.
+
+    Args:
+        factory: Zero-arg callable returning either a list of result
+            rows or a coroutine resolving to one.
+        fallback_on_empty: When False, behaviour is identical to calling
+            ``factory()`` directly.  When True and *all* non-blocked rows
+            are empty, raises ``RuntimeError`` so the dispatcher's
+            retryable-error path advances to the next backend.
+        backend_name: Used only in the raised error message so logs make
+            it obvious which provider produced the empty result.
+
+    Raises:
+        RuntimeError: When ``fallback_on_empty`` is True and the result
+            list contains no usable content.  The message is plain
+            English (no 4xx markers) so :func:`_is_retryable_backend_error`
+            classifies it as retryable.
+    """
+    out = factory()
+    if asyncio.iscoroutine(out):
+        out = await out
+    if fallback_on_empty:
+        # Only raise when there is at least one non-blocked row AND none of
+        # them have usable content.  If every row is blocked, every URL was
+        # intentionally refused — there is nothing for another backend to
+        # try.  If the list is empty, the backend produced no rows at all,
+        # which is also a soft failure worth retrying.
+        non_blocked = [
+            r for r in (out or [])
+            if isinstance(r, dict) and not _is_blocked_extract_row(r)
+        ]
+        if not out or (non_blocked and not _has_extracted_content(out)):
+            raise RuntimeError(
+                f"empty extract: backend={backend_name} returned no content "
+                "for any non-blocked URL"
+            )
+    return out
+
+
 def _try_backend_with_fallback(
     operation: str,
     fn_map: dict,
@@ -314,11 +465,17 @@ def _try_backend_with_fallback(
             )
             last_error = e
         except Exception as e:
+            last_error = e
+            if not _is_retryable_backend_error(e):
+                logger.warning(
+                    "web_%s: backend=%s non-retryable error, stopping chain: %s",
+                    operation, backend, e,
+                )
+                break
             logger.warning(
                 "web_%s: backend=%s failed: %s",
                 operation, backend, e,
             )
-            last_error = e
 
     return tool_error(f"{error_prefix}: {last_error}")
 
@@ -356,11 +513,17 @@ async def _try_backend_with_fallback_async(
             )
             last_error = e
         except Exception as e:
+            last_error = e
+            if not _is_retryable_backend_error(e):
+                logger.warning(
+                    "web_%s: backend=%s non-retryable error, stopping chain: %s",
+                    operation, backend, e,
+                )
+                break
             logger.warning(
                 "web_%s: backend=%s failed: %s",
                 operation, backend, e,
             )
-            last_error = e
 
     return tool_error(f"{error_prefix}: {last_error}")
 
@@ -1780,11 +1943,32 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
+            # Opt-in: when web.fallback_on_empty_extract is true, treat an
+            # extract call that returned without raising but produced zero
+            # usable content as a backend failure so the dispatcher tries
+            # the next provider.  Default-False preserves today's behaviour
+            # where the first non-raising extract wins, even if every row
+            # is empty.  See _extract_with_empty_check for full rationale.
+            _fallback_on_empty = bool(
+                _load_web_config().get("fallback_on_empty_extract", False)
+            )
             fn_map = {
-                "firecrawl": lambda: _firecrawl_extract(safe_urls, format),
-                "parallel":  lambda: _parallel_extract(safe_urls),
-                "tavily":    lambda: _tavily_extract(safe_urls),
-                "exa":       lambda: _exa_extract(safe_urls),
+                "firecrawl": lambda: _extract_with_empty_check(
+                    lambda: _firecrawl_extract(safe_urls, format),
+                    _fallback_on_empty, "firecrawl",
+                ),
+                "parallel": lambda: _extract_with_empty_check(
+                    lambda: _parallel_extract(safe_urls),
+                    _fallback_on_empty, "parallel",
+                ),
+                "tavily": lambda: _extract_with_empty_check(
+                    lambda: _tavily_extract(safe_urls),
+                    _fallback_on_empty, "tavily",
+                ),
+                "exa": lambda: _extract_with_empty_check(
+                    lambda: _exa_extract(safe_urls),
+                    _fallback_on_empty, "exa",
+                ),
             }
             results = await _try_backend_with_fallback_async(
                 "extract", fn_map, "Error extracting content",
