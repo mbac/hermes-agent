@@ -19,6 +19,8 @@ from tools.web_tools import (
     _try_backend_with_fallback,
     _try_backend_with_fallback_async,
     _is_backend_available,
+    _has_extracted_content,
+    _extract_with_empty_check,
     web_search_tool,
 )
 
@@ -91,6 +93,54 @@ class TestBackendCandidates:
             assert len(candidates) == 1  # only firecrawl default
             assert candidates[0] == "firecrawl"
 
+    def test_brave_free_in_search_fallback_chain(self, monkeypatch):
+        """brave-free participates in search auto-fallback when its key is set."""
+        for var in ("EXA_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY",
+                    "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL",
+                    "SEARXNG_URL", "OPENROUTER_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("EXA_API_KEY", "exa-fake")
+        monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-fake")
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False):
+            candidates = _get_backend_candidates("search")
+            assert "exa" in candidates
+            assert "brave-free" in candidates
+            # Free tier trails paid backends.
+            assert candidates.index("exa") < candidates.index("brave-free")
+
+    def test_strict_backend_returns_single_chain(self, monkeypatch):
+        """``web.strict_backend`` collapses chain to the configured backend."""
+        monkeypatch.setenv("EXA_API_KEY", "sk-fake")
+        monkeypatch.setenv("PARALLEL_API_KEY", "sk-fake")
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"backend": "parallel", "strict_backend": True},
+        ):
+            assert _get_backend_candidates() == ["parallel"]
+
+    def test_strict_backend_off_keeps_fallback(self, monkeypatch):
+        """Without strict_backend, chain still includes other available backends."""
+        monkeypatch.setenv("EXA_API_KEY", "sk-fake")
+        monkeypatch.setenv("PARALLEL_API_KEY", "sk-fake")
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"backend": "parallel"},
+        ):
+            candidates = _get_backend_candidates()
+            assert candidates[0] == "parallel"
+            assert len(candidates) > 1
+
+    def test_strict_search_backend_per_capability(self, monkeypatch):
+        """Per-capability strict pin returns only the configured search backend."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        monkeypatch.setenv("EXA_API_KEY", "sk-fake")
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"search_backend": "searxng", "strict_backend": True},
+        ):
+            assert _get_backend_candidates("search") == ["searxng"]
+
     def test_legacy_get_backend(self, monkeypatch):
         """``_get_backend()`` still returns first candidate."""
         monkeypatch.setenv("PARALLEL_API_KEY", "p-fake")
@@ -147,6 +197,45 @@ class TestCallableFallback:
             assert isinstance(result, str)
             data = json.loads(result)
             assert "Error prefix" in data.get("error", "")
+
+    def test_non_retryable_error_stops_chain(self):
+        """4xx user errors short-circuit; the second backend is never invoked."""
+        parallel_called = {"flag": False}
+
+        def _parallel():
+            parallel_called["flag"] = True
+            return _fake_search_result("p")
+
+        fn_map = {
+            "firecrawl": lambda: (_ for _ in ()).throw(
+                RuntimeError("400 invalid query")
+            ),
+            "parallel": _parallel,
+        }
+        with patch(
+            "tools.web_tools._get_backend_candidates",
+            return_value=["firecrawl", "parallel"],
+        ):
+            result = _try_backend_with_fallback("search", fn_map, "Error prefix")
+            assert parallel_called["flag"] is False
+            assert isinstance(result, str)
+            data = json.loads(result)
+            assert "400" in data.get("error", "")
+
+    def test_429_still_retries(self):
+        """Rate-limit errors are retryable: chain continues to next backend."""
+        fn_map = {
+            "firecrawl": lambda: (_ for _ in ()).throw(
+                RuntimeError("429 too many requests")
+            ),
+            "parallel": lambda: _fake_search_result("after-429"),
+        }
+        with patch(
+            "tools.web_tools._get_backend_candidates",
+            return_value=["firecrawl", "parallel"],
+        ):
+            result = _try_backend_with_fallback("search", fn_map, "Error")
+            assert result["data"]["web"][0]["url"] == "after-429"
 
     def test_skip_backend_without_handler(self):
         fn_map = {
@@ -325,6 +414,78 @@ class TestAsyncFallback:
             assert data["results"][0]["title"] == "Exa Page"
             assert data["results"][0]["content"] == "content"
             assert mock_exa.get_contents.called
+
+    @pytest.mark.asyncio
+    async def test_extract_with_empty_check_passes_through_when_off(self):
+        """fallback_on_empty=False: empty results are returned, not raised."""
+        out = await _extract_with_empty_check(
+            lambda: [{"url": "u", "content": "", "raw_content": ""}],
+            fallback_on_empty=False,
+            backend_name="firecrawl",
+        )
+        assert out == [{"url": "u", "content": "", "raw_content": ""}]
+
+    @pytest.mark.asyncio
+    async def test_extract_with_empty_check_raises_when_on(self):
+        """fallback_on_empty=True: all-empty results raise so dispatcher retries."""
+        with pytest.raises(RuntimeError, match="empty extract"):
+            await _extract_with_empty_check(
+                lambda: [{"url": "u", "content": "", "raw_content": ""}],
+                fallback_on_empty=True,
+                backend_name="firecrawl",
+            )
+
+    @pytest.mark.asyncio
+    async def test_extract_with_empty_check_blocked_rows_dont_count(self):
+        """Policy/SSRF-blocked rows are not counted as empty content."""
+        # All-blocked result should NOT raise — those rows reflect intentional
+        # refusals, not backend failures.
+        rows = [
+            {"url": "u1", "content": "", "blocked_by_policy": {"host": "x"}},
+            {"url": "u2", "content": "", "error": "Blocked: URL targets a private network"},
+        ]
+        # No exception expected even with the flag on.
+        out = await _extract_with_empty_check(
+            lambda: rows, fallback_on_empty=True, backend_name="firecrawl",
+        )
+        assert out == rows
+
+    @pytest.mark.asyncio
+    async def test_extract_empty_triggers_backend_fallback(self, monkeypatch):
+        """End-to-end: with fallback_on_empty_extract on, empty firecrawl
+        result causes dispatcher to advance to next backend."""
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-fake")
+        monkeypatch.setenv("PARALLEL_API_KEY", "p-fake")
+
+        async def _empty_firecrawl():
+            return [{"url": "https://example.com", "content": "", "raw_content": ""}]
+
+        def _good_parallel():
+            return [{"url": "https://example.com", "content": "real text", "raw_content": "real text"}]
+
+        fn_map = {
+            "firecrawl": lambda: _extract_with_empty_check(
+                _empty_firecrawl, fallback_on_empty=True, backend_name="firecrawl",
+            ),
+            "parallel": lambda: _extract_with_empty_check(
+                _good_parallel, fallback_on_empty=True, backend_name="parallel",
+            ),
+        }
+        with patch("tools.web_tools._get_backend_candidates",
+                   return_value=["firecrawl", "parallel"]):
+            result = await _try_backend_with_fallback_async("extract", fn_map, "Error")
+            assert result[0]["content"] == "real text"
+
+    def test_has_extracted_content_helper(self):
+        assert _has_extracted_content([{"content": "x"}]) is True
+        assert _has_extracted_content([{"raw_content": "y"}]) is True
+        assert _has_extracted_content([{"content": "  "}]) is False
+        assert _has_extracted_content([]) is False
+        assert _has_extracted_content(None) is False
+        # Blocked rows don't count.
+        assert _has_extracted_content(
+            [{"content": "", "blocked_by_policy": {"host": "x"}}]
+        ) is False
 
     @pytest.mark.asyncio
     async def test_extract_fallback_firecrawl_scrape_error_to_exa(self, monkeypatch):
