@@ -33,6 +33,7 @@ active_profile
 
 # OS noise
 .DS_Store
+._*
 Thumbs.db
 
 # Python / Node build noise (in case a skill ships with these)
