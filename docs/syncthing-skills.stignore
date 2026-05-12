@@ -1,0 +1,47 @@
+# Canonical .stignore for Syncthing folders that share Hermes skills/profiles
+# between hosts. Drop this at the root of any Syncthing folder that points
+# inside $HERMES_HOME (typically $HERMES_HOME/skills, $HERMES_HOME/optional-skills,
+# or $HERMES_HOME/profiles).
+#
+# Usage on each host:
+#   cp docs/syncthing-skills.stignore $HERMES_HOME/skills/.stignore
+#   cp docs/syncthing-skills.stignore $HERMES_HOME/optional-skills/.stignore
+# Re-copy after `git pull` if this file has changed.
+#
+# Critical: never point a Syncthing folder at $HERMES_HOME itself. Always point
+# at a subdirectory. The defensive entries below (.git, hermes-agent, .venv,
+# state.db*) only matter if that rule is broken by accident.
+
+# Secrets and machine-specific runtime state
+.env
+.env.*
+
+# SQLite state (WAL mode; concurrent writes from two hosts would corrupt it)
+state.db
+state.db-*
+state.db-wal
+state.db-shm
+*.sqlite-journal
+
+# Per-host runtime artifacts
+logs/
+cache/
+home/
+active_profile
+.managed
+.container-mode
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Python / Node build noise (in case a skill ships with these)
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+
+# Defensive: protects against accidental misconfiguration where a Syncthing
+# folder is pointed at $HERMES_HOME instead of a subdir
+.git/
+hermes-agent/
