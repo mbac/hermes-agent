@@ -229,6 +229,26 @@ log_warn() {
     echo -e "${YELLOW}⚠${NC} $1"
 }
 
+# Best-effort reclaim of a venv directory whose contents may be owned by
+# another user (typically root, on macOS, after a previous install that
+# ran with elevated privileges). We chown to the current effective user,
+# best effort, and tolerate failure (e.g. running in a chroot without
+# chown available, or the user not being resolvable). This is a
+# defensive pre-step before `rm -rf venv`: bash's `set -e` does NOT fire
+# on partial rm failure, and a single root-owned __pycache__/*.pyc file
+# is enough to leave venv non-empty — which then blocks `uv venv` from
+# recreating it and (silently, in the old code path) produces a
+# broken install with a fake-success bootstrap marker.
+_reclaim_venv_for_user() {
+    local venv_dir="$1"
+    [ -d "$venv_dir" ] || return 0
+    local target_user="${USER:-}"
+    [ -z "$target_user" ] && command -v id >/dev/null 2>&1 && target_user="$(id -un 2>/dev/null)"
+    if [ -n "$target_user" ] && command -v chown >/dev/null 2>&1; then
+        chown -R "$target_user" "$venv_dir" 2>/dev/null || true
+    fi
+}
+
 log_error() {
     echo -e "${RED}✗${NC} $1"
 }
@@ -1190,6 +1210,7 @@ setup_venv() {
 
         if [ -d "venv" ]; then
             log_info "Virtual environment already exists, recreating..."
+            _reclaim_venv_for_user venv
             rm -rf venv
         fi
 
@@ -1202,11 +1223,24 @@ setup_venv() {
 
     if [ -d "venv" ]; then
         log_info "Virtual environment already exists, recreating..."
+        _reclaim_venv_for_user venv
         rm -rf venv
     fi
 
-    # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    # uv creates the venv and pins the Python version in one step.
+    # Refuse to lie: if uv cannot create the venv (e.g. because a previous
+    # install left a non-empty directory and rm failed), fail the stage
+    # with a real diagnostic instead of printing a fake success.
+    if ! $UV_CMD venv venv --python "$PYTHON_VERSION"; then
+        log_error "Failed to create virtual environment at $INSTALL_DIR/venv"
+        log_info "Common cause: a previous install (possibly run as root or via"
+        log_info "the desktop app) left root-owned files inside venv that block"
+        log_info "a clean recreate. Manual recovery:"
+        log_info "  sudo chown -R \"\$USER\" $INSTALL_DIR/venv"
+        log_info "  rm -rf $INSTALL_DIR/venv"
+        log_info "Then re-run: hermes update"
+        return 1
+    fi
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
@@ -1365,6 +1399,24 @@ install_deps() {
             log_success "All dependencies installed"
             return 0
         fi
+        # The hash-verified tier failed. We MUST verify the venv is actually
+        # usable before letting the multi-tier PyPI fallback run — otherwise
+        # a half-broken venv (e.g. one whose rm -rf venv failed because of
+        # root-owned __pycache__ files from a previous install) can produce
+        # a `uv pip install` exit 0 that did NOT actually install the
+        # package, which the function would then log as success. Detect
+        # the broken-venv case here and bail with a real error so the
+        # user sees it instead of looping in the GUI's Deps section.
+        if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
+            log_error "uv.lock sync failed AND venv/bin/python is missing"
+            log_error "The venv is not usable. The most likely cause is a previous"
+            log_error "install (run as root, or via the desktop app) left files in"
+            log_error "venv that blocked cleanup. Manual recovery:"
+            log_error "  sudo chown -R \"\$USER\" $INSTALL_DIR/venv"
+            log_error "  rm -rf $INSTALL_DIR/venv"
+            log_error "Then re-run: hermes update"
+            return 1
+        fi
         log_warn "uv.lock sync failed (see uv output above), falling back to PyPI resolve..."
     else
         log_info "uv.lock not found — falling back to PyPI resolve (no hash verification)"
@@ -1489,16 +1541,22 @@ setup_path() {
         fi
     fi
 
-    # Verify the entry point script was actually generated
+    # Verify the entry point script was actually generated.
+    # Refuse to lie: a missing hermes entry point is a hard install
+    # failure, not a soft warning. Returning 0 here means the bootstrap
+    # reports success, writes .hermes-bootstrap-complete, and the
+    # desktop app will then re-run the bootstrap in a loop because
+    # hermes_cli is unimportable. Returning 1 surfaces the failure to
+    # the caller so the user sees a real error.
     if [ ! -x "$HERMES_BIN" ]; then
-        log_warn "hermes entry point not found at $HERMES_BIN"
+        log_error "hermes entry point not found at $HERMES_BIN"
         log_info "This usually means the pip install didn't complete successfully."
         if [ "$DISTRO" = "termux" ]; then
             log_info "Try: cd $INSTALL_DIR && python -m pip install -e '.[termux-all]' -c constraints-termux.txt"
         else
-            log_info "Try: cd $INSTALL_DIR && uv pip install -e '.[all]'"
+            log_info "Try: cd $INSTALL_DIR && uv pip install --python venv/bin/python -e '.[all]'"
         fi
-        return 0
+        return 1
     fi
 
     local command_link_dir
