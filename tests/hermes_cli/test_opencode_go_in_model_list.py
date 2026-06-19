@@ -13,6 +13,7 @@ from hermes_cli.model_switch import list_authenticated_providers
 _OPENCODE_GO_REQUIRED = {
     "kimi-k2.6",
     "kimi-k2.5",
+    "glm-5.2",
     "glm-5.1",
     "glm-5",
     "mimo-v2-pro",
