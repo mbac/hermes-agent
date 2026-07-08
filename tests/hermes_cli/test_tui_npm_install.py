@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import json
 import os
 import types
 from pathlib import Path
@@ -101,6 +102,79 @@ def test_install_when_version_differs_even_with_peer_drop(tmp_path: Path, main_m
         '{"packages":{"node_modules/foo":{"version":"1.0.0","dev":true}}}'
     )
     assert main_mod._tui_need_npm_install(tmp_path) is True
+
+
+def test_lockfile_workspace_closure_walks_transitive_deps_and_hoisting(main_mod) -> None:
+    packages = {
+        "ui-tui": {"dependencies": {"foo": "^1.0.0"}},
+        "node_modules/foo": {"version": "1.0.0", "dependencies": {"bar": "^2.0.0"}},
+        # bar is nested (not hoisted) under foo, e.g. due to a version conflict.
+        "node_modules/foo/node_modules/bar": {"version": "2.0.0"},
+        # baz belongs to an unrelated workspace and must not be reachable.
+        "apps/other": {"dependencies": {"baz": "^1.0.0"}},
+        "node_modules/baz": {"version": "1.0.0"},
+    }
+    closure = main_mod._tui_lockfile_workspace_closure(packages, "ui-tui")
+    assert closure == {"node_modules/foo", "node_modules/foo/node_modules/bar"}
+
+
+def test_no_install_when_only_other_workspace_deps_missing_from_hidden_lock(
+    tmp_path: Path, main_mod
+) -> None:
+    """Monorepo: unrelated workspaces' hoisted deps are never installed by the
+    scoped ``npm install --workspace ui-tui``, so their absence from the
+    hidden lock must not count as "missing". Regression for "Installing TUI
+    dependencies…" firing on every launch even though nothing changes.
+    See #38772.
+    """
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    _touch_ink(tmp_path)
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "packages": {
+                    "ui-tui": {"dependencies": {"foo": "^1.0.0"}},
+                    "node_modules/foo": {"version": "1.0.0"},
+                    "apps/other": {"dependencies": {"bar": "^1.0.0"}},
+                    "node_modules/bar": {"version": "1.0.0"},
+                }
+            }
+        )
+    )
+    (tmp_path / "node_modules" / ".package-lock.json").write_text(
+        json.dumps({"packages": {"node_modules/foo": {"version": "1.0.0"}}})
+    )
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
+def test_need_install_when_own_workspace_dep_missing_from_hidden_lock(
+    tmp_path: Path, main_mod
+) -> None:
+    """A genuinely missing dependency of ui-tui itself must still trigger a
+    reinstall, even alongside unrelated workspaces' absent deps."""
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    _touch_ink(tmp_path)
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "packages": {
+                    "ui-tui": {"dependencies": {"foo": "^1.0.0", "baz": "^1.0.0"}},
+                    "node_modules/foo": {"version": "1.0.0"},
+                    "node_modules/baz": {"version": "1.0.0"},
+                    "apps/other": {"dependencies": {"bar": "^1.0.0"}},
+                    "node_modules/bar": {"version": "1.0.0"},
+                }
+            }
+        )
+    )
+    (tmp_path / "node_modules" / ".package-lock.json").write_text(
+        json.dumps({"packages": {"node_modules/foo": {"version": "1.0.0"}}})
+    )
+    assert main_mod._tui_need_npm_install(tui_dir) is True
 
 
 def test_no_install_when_lock_older_than_marker(tmp_path: Path, main_mod) -> None:

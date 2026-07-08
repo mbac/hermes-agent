@@ -1447,6 +1447,54 @@ def _termux_workspace_install_context(
     return ws_root, tuple(workspace_args)
 
 
+def _tui_lockfile_workspace_closure(
+    packages: dict, workspace_rel: str
+) -> set[str]:
+    """Return lockfile ``packages`` keys reachable from *workspace_rel*.
+
+    Walks ``dependencies``/``devDependencies``/``optionalDependencies`` the
+    way node_modules resolution would: for a dependency declared at
+    ``location``, prefer the nearest ``<ancestor>/node_modules/<name>``
+    entry, walking up to the workspace root's hoisted ``node_modules/<name>``.
+    Used to scope the install-check comparison to a single workspace member
+    instead of every workspace in the monorepo's lockfile.
+    """
+
+    def resolve(location: str, name: str) -> str | None:
+        parts = location.split("/") if location else []
+        while True:
+            prefix = "/".join(parts)
+            candidate = f"{prefix}/node_modules/{name}" if prefix else f"node_modules/{name}"
+            if candidate in packages:
+                return candidate
+            if not parts:
+                return None
+            parts.pop()
+
+    seen: set[str] = set()
+    queue = [workspace_rel]
+    while queue:
+        location = queue.pop()
+        if location in seen:
+            continue
+        seen.add(location)
+        pkg = packages.get(location)
+        if not isinstance(pkg, dict):
+            continue
+        deps: dict = {}
+        for key in ("dependencies", "devDependencies", "optionalDependencies"):
+            value = pkg.get(key)
+            if isinstance(value, dict):
+                deps.update(value)
+        for name in deps:
+            resolved = resolve(location, name)
+            if resolved is not None and resolved not in seen:
+                queue.append(resolved)
+
+    seen.discard(workspace_rel)
+    return seen
+
+
 def _tui_need_npm_install(root: Path) -> bool:
     """True when @hermes/ink is missing or node_modules is behind package-lock.json.
 
@@ -1467,7 +1515,16 @@ def _tui_need_npm_install(root: Path) -> bool:
     already match, which used to trigger a spurious "Installing TUI
     dependencies" on every launch.
 
-    For each entry in the root lock's ``packages`` map:
+    In a monorepo checkout the root lock's ``packages`` map covers every
+    workspace member, but ``npm install`` here is scoped to this workspace
+    only (``--workspace ui-tui``).  Unrelated workspaces' hoisted deps are
+    never installed and would otherwise show up as permanently "missing",
+    triggering a reinstall on every launch that never actually changes
+    anything.  :func:`_tui_lockfile_workspace_closure` restricts the
+    comparison to the packages reachable from this workspace's own
+    dependency graph.
+
+    For each (closure-filtered) entry in the root lock's ``packages`` map:
       - missing from hidden lock → reinstall (unless the entry is marked
         ``optional`` or ``peer``, which npm may intentionally skip per platform)
       - present but with differing fields (excluding npm-written runtime
@@ -1504,6 +1561,22 @@ def _tui_need_npm_install(root: Path) -> bool:
         installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return lock.stat().st_mtime > marker.stat().st_mtime
+
+    if ws_root != root:
+        # Monorepo layout: the root lockfile's "packages" map enumerates
+        # every workspace member's dependencies, but `npm install` here is
+        # scoped to this workspace only (--workspace ui-tui, see #38772).
+        # Unrelated workspaces (apps/desktop, apps/assistant-ui, ...) are
+        # never installed, so their hoisted deps are permanently "missing"
+        # from the hidden lock — comparing against the full map flagged
+        # hundreds of never-installed, never-needed entries on every
+        # launch, printing "Installing TUI dependencies…" forever even
+        # though the reinstall never changed anything. Restrict the
+        # comparison to what this workspace's own dependency graph
+        # actually resolves to.
+        workspace_rel = root.relative_to(ws_root).as_posix()
+        reachable = _tui_lockfile_workspace_closure(wanted, workspace_rel)
+        wanted = {name: pkg for name, pkg in wanted.items() if name in reachable}
 
     def comparable(pkg: dict) -> dict:
         return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
