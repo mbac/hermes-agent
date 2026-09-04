@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import builtins
+import io
 import os
 import signal
 import sys
@@ -142,3 +144,68 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+    @staticmethod
+    def _fake_systemd(monkeypatch, user_output, system_output):
+        """Pretend we are PID-1-supervised inside hermes-gateway.service.
+
+        ``user_output``/``system_output`` are the stdout ``systemctl show``
+        returns for the ``--user`` and system managers respectively.
+        """
+        import subprocess as _sp
+
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if str(path) == "/proc/self/cgroup":
+                return io.StringIO("0::/system.slice/hermes-gateway.service\n")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+
+        def fake_run(cmd, **kw):
+            out = user_output if "--user" in cmd else system_output
+            return _sp.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+    def test_ignores_manager_where_unit_is_not_loaded(self, monkeypatch):
+        """A system-unit install must not be judged by the --user manager.
+
+        ``systemctl --user show`` exits 0 for a unit it has never heard of and
+        prints systemd's *defaults* (TimeoutStopUSec=1min 30s). Trusting that
+        made every boot log a bogus "stale systemd unit (TimeoutStopSec=90s)"
+        warning against a unit that was actually current.
+        """
+        self._fake_systemd(
+            monkeypatch,
+            user_output="TimeoutStopUSec=1min 30s\nLoadState=not-found\n",
+            system_output="TimeoutStopUSec=10min 30s\nLoadState=loaded\n",
+        )
+        result = sf.check_systemd_timing_alignment(600.0, 30.0)
+        assert result is not None
+        # 630s from the *system* manager, not 90s from the --user default.
+        assert result["timeout_stop_sec"] == 630.0
+        assert not result["mismatch"]
+
+    def test_still_reports_a_genuinely_short_timeout(self, monkeypatch):
+        """The real stale-unit case must still be detected."""
+        self._fake_systemd(
+            monkeypatch,
+            user_output="TimeoutStopUSec=1min 30s\nLoadState=not-found\n",
+            system_output="TimeoutStopUSec=1min 30s\nLoadState=loaded\n",
+        )
+        result = sf.check_systemd_timing_alignment(600.0, 30.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 90.0
+        assert result["mismatch"]
+
+    def test_returns_none_when_no_manager_has_the_unit(self, monkeypatch):
+        self._fake_systemd(
+            monkeypatch,
+            user_output="TimeoutStopUSec=1min 30s\nLoadState=not-found\n",
+            system_output="TimeoutStopUSec=1min 30s\nLoadState=not-found\n",
+        )
+        assert sf.check_systemd_timing_alignment(600.0, 30.0) is None

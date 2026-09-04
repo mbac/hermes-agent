@@ -376,25 +376,39 @@ def check_systemd_timing_alignment(
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=TimeoutStopUSec", "--property=LoadState",
+                ],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
+        # ``systemctl show`` exits 0 even for a unit this manager has never
+        # heard of, printing systemd's *defaults* (TimeoutStopUSec=1min 30s).
+        # Without the LoadState gate the ``--user`` probe therefore always
+        # "succeeds" on a system-unit install, the system manager is never
+        # queried, and every boot logs a bogus "stale systemd unit
+        # (TimeoutStopSec=90s)" warning against a perfectly current unit.
+        load_state: Optional[str] = None
+        candidate_us: Optional[int] = None
         # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
         for line in result.stdout.splitlines():
-            if line.startswith("TimeoutStopUSec="):
+            if line.startswith("LoadState="):
+                load_state = line.split("=", 1)[1].strip()
+            elif line.startswith("TimeoutStopUSec="):
                 value = line.split("=", 1)[1].strip()
                 # Try numeric microseconds first
                 if value.isdigit():
-                    timeout_us = int(value)
+                    candidate_us = int(value)
                 else:
-                    timeout_us = parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
-        if timeout_us is not None:
+                    candidate_us = parse_systemd_duration_to_us(value)
+        if load_state != "loaded":
+            continue
+        if candidate_us is not None:
+            timeout_us = candidate_us
             break
 
     if timeout_us is None:
